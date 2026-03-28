@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -62,8 +62,8 @@ public partial class Radar
             {
                 X = kvp.Key.X,
                 Y = kvp.Key.Y,
-                W = TileToGridConversion,
-                H = TileToGridConversion,
+                W = ExileCore.Shared.Helpers.PoeMapExtension.TileToGridConversion,
+                H = ExileCore.Shared.Helpers.PoeMapExtension.TileToGridConversion,
                 Tiles = kvp.Value
             }).ToList();
 

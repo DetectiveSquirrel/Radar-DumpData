@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
@@ -207,8 +207,8 @@ public partial class Radar
             var key2 = GameController.Memory.Read<TgtDetailStruct>(tgtTileStruct.TgtDetailPtr)
                 .name.ToString(GameController.Memory);
             var coordinate = new Vector2i(
-                tileNumber % _terrainMetadata.NumCols * TileToGridConversion,
-                tileNumber / _terrainMetadata.NumCols * TileToGridConversion);
+                tileNumber % _terrainMetadata.NumCols * PoeMapExtension.TileToGridConversion,
+                tileNumber / _terrainMetadata.NumCols * PoeMapExtension.TileToGridConversion);
 
             if (Settings.PathfindingSettings.IncludeTilePathsAsTargets)
             {

@@ -1,59 +1,65 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Linq;
-using System.Numerics;
-using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using ExileCore;
 using ExileCore.PoEMemory.Components;
 using ExileCore.PoEMemory.Elements;
 using ExileCore.PoEMemory.MemoryObjects;
-using ExileCore.Shared;
+using ExileCore.Shared.Enums;
 using ExileCore.Shared.Helpers;
 using GameOffsets;
 using GameOffsets.Native;
-using ImGuiNET;
+using SharpDX;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using Positioned = ExileCore.PoEMemory.Components.Positioned;
+using Vector2 = System.Numerics.Vector2;
+using Vector3 = System.Numerics.Vector3;
 
 namespace Radar;
 
 public partial class Radar : BaseSettingsPlugin<RadarSettings>
 {
     private const string TextureName = "radar_minimap";
-    private const int TileToGridConversion = 23;
-    private const int TileToWorldConversion = 250;
-    public const float GridToWorldMultiplier = TileToWorldConversion / (float)TileToGridConversion;
-    private const double CameraAngle = 38.7 * Math.PI / 180;
-    private static readonly float CameraAngleCos = (float)Math.Cos(CameraAngle);
-    private static readonly float CameraAngleSin = (float)Math.Sin(CameraAngle);
-    private double _mapScale;
+    public const float GridToWorldMultiplier = PoeMapExtension.TileToWorldConversion / (float)PoeMapExtension.TileToGridConversion;
 
-    private ConcurrentDictionary<string, List<TargetDescription>> _targetDescriptions = new();
+    private static readonly List<Color> RainbowColors = new List<System.Drawing.Color>
+    {
+        System.Drawing.Color.Red,
+        System.Drawing.Color.LightGreen,
+        System.Drawing.Color.White,
+        System.Drawing.Color.Yellow,
+        System.Drawing.Color.LightBlue,
+        System.Drawing.Color.Violet,
+        System.Drawing.Color.Blue,
+        System.Drawing.Color.Orange,
+        System.Drawing.Color.Indigo
+    }.Select(x => x.ToSharpDx()).ToList();
+
+    private ConcurrentDictionary<string, List<Vector2i>> _allTargetLocations = new();
     private Vector2i? _areaDimensions;
-    private TerrainData _terrainMetadata;
+    private ConcurrentDictionary<string, TargetLocations> _clusteredTargetLocations = new();
+    private List<(Regex, TargetDescription x)> _currentZoneTargetEntityPaths = new();
+    private CancellationTokenSource _findPathsCts = new();
     private float[][] _heightData;
+    private ConcurrentDictionary<Vector2i, List<string>> _locationsByPosition = new();
     private int[][] _processedTerrainData;
     private int[][] _processedTerrainTargetingData;
-    private Dictionary<string, TargetDescription> _targetDescriptionsInArea = new();
-    private List<(Regex, TargetDescription x)> _currentZoneTargetEntityPaths = new();
-    private CancellationTokenSource _findPathsCts = new CancellationTokenSource();
-    private ConcurrentDictionary<string, TargetLocations> _clusteredTargetLocations = new();
-    private ConcurrentDictionary<string, List<Vector2i>> _allTargetLocations = new();
-    private ConcurrentDictionary<Vector2i, List<string>> _locationsByPosition = new();
-    private SharpDX.RectangleF _rect;
-    private ImDrawListPtr _backGroundWindowPtr;
+    private RectangleF _rect;
     private ConcurrentDictionary<Vector2, RouteDescription> _routes = new();
+
+    private ConcurrentDictionary<string, List<TargetDescription>> _targetDescriptions = new();
+    private Dictionary<string, TargetDescription> _targetDescriptionsInArea = new();
+    private TerrainData _terrainMetadata;
 
     public override bool Initialise()
     {
         GameController.PluginBridge.SaveMethod("Radar.LookForRoute",
-            (Vector2 target, Action<List<Vector2i>> callback, CancellationToken cancellationToken) =>
-                AddRoute(target, null, callback, cancellationToken));
-        GameController.PluginBridge.SaveMethod("Radar.ClusterTarget",
-            (string targetName, int expectedCount) => ClusterTarget(targetName, expectedCount));
+            (Vector2 target, Action<List<Vector2i>> callback, CancellationToken cancellationToken) => AddRoute(target, null, callback, cancellationToken));
+
+        GameController.PluginBridge.SaveMethod("Radar.ClusterTarget", (string targetName, int expectedCount) => ClusterTarget(targetName, expectedCount));
 
         Input.RegisterKey(Settings.ManuallyDumpInstance.Value);
         Settings.ManuallyDumpInstance.OnValueChanged += () => { Input.RegisterKey(Settings.ManuallyDumpInstance.Value); };
@@ -66,26 +72,20 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
         if (GameController.Game.IsInGameState || GameController.Game.IsEscapeState)
         {
             _targetDescriptionsInArea = GetTargetDescriptionsInArea().DistinctBy(x => x.Name).ToDictionary(x => x.Name);
-            _currentZoneTargetEntityPaths = _targetDescriptionsInArea.Values.Where(x => x.TargetType == TargetType.Entity).DistinctBy(x => x.Name).Select(x=>(x.Name.ToLikeRegex(), x)).ToList();
+            _currentZoneTargetEntityPaths = _targetDescriptionsInArea.Values.Where(x => x.TargetType == TargetType.Entity).DistinctBy(x => x.Name).Select(x => (x.Name.ToLikeRegex(), x)).ToList();
             _terrainMetadata = GameController.IngameState.Data.DataStruct.Terrain;
             _heightData = GameController.IngameState.Data.RawTerrainHeightData;
             _allTargetLocations = GetTargets();
-            _locationsByPosition = new ConcurrentDictionary<Vector2i, List<string>>(_allTargetLocations
-                .SelectMany(x => x.Value.Select(y => (x.Key, y)))
-                .ToLookup(x => x.y, x => x.Key)
+            _locationsByPosition = new ConcurrentDictionary<Vector2i, List<string>>(_allTargetLocations.SelectMany(x => x.Value.Select(y => (x.Key, y))).ToLookup(x => x.y, x => x.Key)
                 .ToDictionary(x => x.Key, x => x.ToList()));
+
             _areaDimensions = GameController.IngameState.Data.AreaDimensions;
-            _processedTerrainData = Settings.ClearTriggerableBlockades 
-                ? GameController.IngameState.Data.GetClearedPathfindingData() 
-                : GameController.IngameState.Data.RawPathfindingData;
+            _processedTerrainData = Settings.ClearTriggerableBlockades ? GameController.IngameState.Data.GetClearedPathfindingData() : GameController.IngameState.Data.RawPathfindingData;
             _processedTerrainTargetingData = GameController.IngameState.Data.RawTerrainTargetingData;
 
             if (Settings.AutoDumpInstanceOnAreaChange)
             {
-                Task.Run(() =>
-                {
-                    DumpInstanceData($@"{DirectoryFullName}\instance_dumps\{GameController.Area.CurrentArea.Area.RawName}_{SanitizeAreaName(GameController.Area.CurrentArea.Area.Name)}.json.gz");
-                });
+                Task.Run(() => { DumpInstanceData(GetInstanceDumpPath()); });
             }
 
             GenerateMapTexture();
@@ -94,32 +94,15 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
         }
     }
 
-    private static string SanitizeAreaName(string name)
-    {
-        return name.Replace(" ", "_")
-            .Replace(":", "")
-            .Replace("/", "")
-            .Replace("\\", "");
-    }
+    private static string SanitizeAreaName(string name) => name.Replace(" ", "_").Replace(":", "").Replace("/", "").Replace("\\", "");
+
+    private string GetInstanceDumpPath() => $@"{DirectoryFullName}\instance_dumps\{GameController.Area.CurrentArea.Area.Id}_{SanitizeAreaName(GameController.Area.CurrentArea.Area.Name)}.json.gz";
 
     public override void DrawSettings()
     {
-        Settings.PathfindingSettings.CurrentZoneName.Value = GameController.Area.CurrentArea.Area.RawName;
+        Settings.PathfindingSettings.CurrentZoneName.Value = GameController.Area.CurrentArea.Area.Id;
         base.DrawSettings();
     }
-
-    private static readonly List<SharpDX.Color> RainbowColors = new List<Color>
-    {
-        Color.Red,
-        Color.LightGreen,
-        Color.White,
-        Color.Yellow,
-        Color.LightBlue,
-        Color.Violet,
-        Color.Blue,
-        Color.Orange,
-        Color.Indigo,
-    }.Select(x => x.ToSharpDx()).ToList();
 
     public override void OnLoad()
     {
@@ -132,6 +115,7 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
                 AreaChange(GameController.Area.CurrentArea);
             });
         };
+
         Settings.MaximumPathCount.OnValueChanged += (_, _) => { Task.Run(RestartPathFinding); };
         Settings.TerrainColor.OnValueChanged += (_, _) => { GenerateMapTexture(); };
         Settings.Debug.DrawHeightMap.OnValueChanged += (_, _) => { GenerateMapTexture(); };
@@ -152,21 +136,21 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
         if (positioned != null)
         {
             var path = entity.Path;
-            if (_currentZoneTargetEntityPaths.FirstOrDefault(x=>x.Item1.IsMatch(path)).x is {} targetDescription)
+            if (_currentZoneTargetEntityPaths.FirstOrDefault(x => x.Item1.IsMatch(path)).x is { } targetDescription)
             {
-                bool alreadyContains = false;
+                var alreadyContains = false;
                 var truncatedPos = positioned.GridPosNum.Truncate();
                 _allTargetLocations.AddOrUpdate(targetDescription.Name, _ => [truncatedPos],
                     // ReSharper disable once AssignmentInConditionalExpression
                     (_, l) => (alreadyContains = l.Contains(truncatedPos)) ? l : [..l, truncatedPos]);
-                _locationsByPosition.AddOrUpdate(truncatedPos, _ => [targetDescription.Name],
-                    (_, l) => l.Contains(targetDescription.Name) ? l : [..l, targetDescription.Name]);
+
+                _locationsByPosition.AddOrUpdate(truncatedPos, _ => [targetDescription.Name], (_, l) => l.Contains(targetDescription.Name) ? l : [..l, targetDescription.Name]);
                 if (!alreadyContains)
                 {
                     var oldValue = _clusteredTargetLocations.GetValueOrDefault(targetDescription.Name);
-                    var newValue = _clusteredTargetLocations.AddOrUpdate(targetDescription.Name,
-                        _ => ClusterTarget(_targetDescriptionsInArea[targetDescription.Name]),
+                    var newValue = _clusteredTargetLocations.AddOrUpdate(targetDescription.Name, _ => ClusterTarget(_targetDescriptionsInArea[targetDescription.Name]),
                         (_, _) => ClusterTarget(_targetDescriptionsInArea[targetDescription.Name]));
+
                     foreach (var newLocation in newValue.Locations.Except(oldValue?.Locations ?? []))
                     {
                         AddRoute(newLocation, targetDescription, entity);
@@ -176,43 +160,43 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
         }
     }
 
-    private Vector2 GetPlayerPosition()
+    private Vector2 GetPlayerMapGrid()
     {
-        var player = GameController.Game.IngameState.Data.LocalPlayer;
-        var playerPositionComponent = player.GetComponent<Positioned>();
-        if (playerPositionComponent == null)
-            return new Vector2(0, 0);
-        var playerPosition = new Vector2(playerPositionComponent.GridX, playerPositionComponent.GridY);
-        return playerPosition;
+        var pos = GameController.Game.IngameState.Data.LocalPlayer.PosNum;
+        return new Vector2(pos.X * PoeMapExtension.WorldToGridConversion, pos.Y * PoeMapExtension.WorldToGridConversion);
+    }
+
+    private Vector2 GetPlayerTerrainGrid()
+    {
+        var pos = GameController.Game.IngameState.Data.LocalPlayer?.GetComponent<Positioned>();
+        return pos == null ? GetPlayerMapGrid() : new Vector2(pos.GridX, pos.GridY);
+    }
+
+    private Vector2 GetPlayerPosition() => GetPlayerMapGrid();
+
+    private SubMap GetVisibleSubMap()
+    {
+        var map = GameController.Game.IngameState.IngameUi.Map;
+        return map.VisibleSubMap == VisibleSubMap.Small ? map.SmallMiniMap : map.LargeMap.AsObject<SubMap>();
     }
 
     public override void Render()
     {
         if (Settings.ManuallyDumpInstance.PressedOnce())
         {
-            Task.Run(() =>
-            {
-                DumpInstanceData($@"{DirectoryFullName}\instance_dumps\{GameController.Area.CurrentArea.Area.RawName}_{SanitizeAreaName(GameController.Area.CurrentArea.Area.Name)}.json.gz");
-            });
+            Task.Run(() => { DumpInstanceData(GetInstanceDumpPath()); });
         }
 
-        if (!Settings.Debug.RenderInPeacefulZones && GameController.Area.CurrentArea.IsPeaceful)
-            return;
+        if (!Settings.Debug.RenderInPeacefulZones && GameController.Area.CurrentArea.IsPeaceful) return;
 
         var ingameUi = GameController.Game.IngameState.IngameUi;
-        if (!Settings.Debug.IgnoreFullscreenPanels &&
-            ingameUi.FullscreenPanels.Any(x => x.IsVisible))
-        {
-            return;
-        }
+        var anyFullscreenPanelVisible = ingameUi.FullscreenPanels.Any(x => x.IsVisible);
+        if (!Settings.Debug.IgnoreFullscreenPanels && anyFullscreenPanelVisible) return;
 
-        if (!Settings.Debug.IgnoreLargePanels &&
-            ingameUi.LargePanels.Any(x => x.IsVisible))
-        {
-            return;
-        }
+        var anyLargePanelVisible = ingameUi.LargePanels.Any(x => x.IsVisible);
+        if (!Settings.Debug.IgnoreLargePanels && anyLargePanelVisible) return;
 
-        _rect = GameController.Window.GetWindowRectangle() with { Location = SharpDX.Vector2.Zero };
+        _rect = GameController.Window.GetWindowRectangle() with {Location = SharpDX.Vector2.Zero};
         if (!Settings.Debug.DisableDrawRegionLimiting)
         {
             if (ingameUi.OpenRightPanel.IsVisible)
@@ -226,46 +210,28 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
             }
         }
 
-        ImGui.SetNextWindowSize(new Vector2(_rect.Width, _rect.Height));
-        ImGui.SetNextWindowPos(new Vector2(_rect.Left, _rect.Top));
-
-        ImGui.Begin("radar_background",
-            ImGuiWindowFlags.NoDecoration |
-            ImGuiWindowFlags.NoInputs |
-            ImGuiWindowFlags.NoMove |
-            ImGuiWindowFlags.NoScrollWithMouse |
-            ImGuiWindowFlags.NoSavedSettings |
-            ImGuiWindowFlags.NoFocusOnAppearing |
-            ImGuiWindowFlags.NoBringToFrontOnFocus |
-            ImGuiWindowFlags.NoBackground);
-
-        _backGroundWindowPtr = ImGui.GetWindowDrawList();
-        var map = ingameUi.Map;
-        var largeMap = map.LargeMap.AsObject<SubMap>();
-        if (largeMap.IsVisible)
+        if (ingameUi.Map.VisibleSubMap != VisibleSubMap.None)
         {
-            var mapCenter = largeMap.MapCenter + new Vector2(Settings.Debug.MapCenterOffsetX, Settings.Debug.MapCenterOffsetY);
-            _mapScale = largeMap.MapScale * Settings.CustomScale;
-            DrawLargeMap(mapCenter);
-            DrawTargets(mapCenter);
+            using (Graphics.MapSurfaceClip(VisibleSubMap.Any))
+            {
+                DrawLargeMap();
+                DrawTargets();
+            }
         }
 
-        DrawWorldPaths(largeMap);
-        ImGui.End();
+        DrawWorldPaths(ingameUi.Map.LargeMap.AsObject<SubMap>());
     }
 
     private void DrawWorldPaths(SubMap largeMap)
     {
-        if (Settings.PathfindingSettings.WorldPathSettings.ShowPathsToTargets &&
-            (!largeMap.IsVisible || !Settings.PathfindingSettings.WorldPathSettings.ShowPathsToTargetsOnlyWithClosedMap))
+        var worldPathSettings = Settings.PathfindingSettings.WorldPathSettings;
+        if (worldPathSettings.ShowPathsToTargets && (!largeMap.IsVisible || !worldPathSettings.ShowPathsToTargetsOnlyWithClosedMap))
         {
             var player = GameController.Game.IngameState.Data.LocalPlayer;
             var playerRender = player?.GetComponent<Render>();
-            if (playerRender == null)
-                return;
-            var initPos = GameController.IngameState.Camera.WorldToScreen(playerRender.PosNum with { Z = playerRender.RenderStruct.Height });
-            foreach (var (route, offsetAmount) in _routes.Values
-                         .GroupBy(x => x.Path.Count < 2 ? 0 : (x.Path[1] - x.Path[0]) switch { var diff => Math.Atan2(diff.Y, diff.X) })
+            if (playerRender == null) return;
+            var initPos = GameController.IngameState.Camera.WorldToScreen(playerRender.PosNum with {Z = playerRender.RenderStruct.Height});
+            foreach (var (route, offsetAmount) in _routes.Values.GroupBy(x => x.Path.Count < 2 ? 0 : (x.Path[1] - x.Path[0]) switch {var diff => Math.Atan2(diff.Y, diff.X)})
                          .SelectMany(group => group.Select((route, i) => (route, i - group.Count() / 2.0f + 0.5f))))
             {
                 var p0 = initPos;
@@ -273,19 +239,16 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
                 var i = 0;
                 foreach (var elem in route.Path)
                 {
-                    var p1 = GameController.IngameState.Camera.WorldToScreen(
-                        new Vector3(elem.X * GridToWorldMultiplier, elem.Y * GridToWorldMultiplier, _heightData[elem.Y][elem.X]));
-                    var offsetDirection = Settings.PathfindingSettings.WorldPathSettings.OffsetPaths
-                        ? (p1 - p0) switch { var s => new Vector2(s.Y, -s.X) / s.Length() }
-                        : Vector2.Zero;
-                    var finalOffset = offsetDirection * offsetAmount * Settings.PathfindingSettings.WorldPathSettings.PathThickness;
+                    var p1 = GameController.IngameState.Camera.WorldToScreen(new Vector3(elem.X * GridToWorldMultiplier, elem.Y * GridToWorldMultiplier, _heightData[elem.Y][elem.X]));
+                    var offsetDirection = worldPathSettings.OffsetPaths ? (p1 - p0) switch {var s => new Vector2(s.Y, -s.X) / s.Length()} : Vector2.Zero;
+                    var finalOffset = offsetDirection * offsetAmount * worldPathSettings.PathThickness;
                     p0 = p1;
                     p1 += finalOffset;
-                    if (++i % Settings.PathfindingSettings.WorldPathSettings.DrawEveryNthSegment == 0)
+                    if (++i % worldPathSettings.DrawEveryNthSegment == 0)
                     {
                         if (_rect.Contains(p0WithOffset) || _rect.Contains(p1))
                         {
-                            Graphics.DrawLine(p0WithOffset, p1, Settings.PathfindingSettings.WorldPathSettings.PathThickness, route.WorldColor());
+                            Graphics.DrawLine(p0WithOffset, p1, worldPathSettings.PathThickness, route.WorldColor());
                         }
                         else
                         {
@@ -299,50 +262,49 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
         }
     }
 
-    private void DrawBox(Vector2 p0, Vector2 p1, SharpDX.Color color)
+    private Vector2 MapGridToScreen(Vector2 gridCell, bool perCellTerrain = true)
     {
-        _backGroundWindowPtr.AddRectFilled(p0, p1, color.ToImgui());
-    }
-
-    private void DrawText(string text, Vector2 pos, SharpDX.Color color)
-    {
-        _backGroundWindowPtr.AddText(pos, color.ToImgui(), text);
-    }
-
-    private Vector2 TranslateGridDeltaToMapDelta(Vector2 delta, float deltaZ)
-    {
-        deltaZ /= GridToWorldMultiplier; //z is normally "world" units, translate to grid
-        return (float)_mapScale * new Vector2((delta.X - delta.Y) * CameraAngleCos, (deltaZ - (delta.X + delta.Y)) * CameraAngleSin);
-    }
-
-    private void DrawLargeMap(Vector2 mapCenter)
-    {
-        if (!Settings.DrawWalkableMap || !Graphics.HasImage(TextureName) || _areaDimensions == null)
-            return;
-        var player = GameController.Game.IngameState.Data.LocalPlayer;
-        var playerRender = player.GetComponent<Render>();
+        var absoluteGridPosition = new Vector2(gridCell.X, gridCell.Y);
+        var playerGridPosition = GetPlayerMapGrid();
+        var playerTerrain = GetPlayerTerrainGrid();
+        var playerScreenPosition = Graphics.GridToMap(playerGridPosition, playerTerrain, VisibleSubMap.Any);
+        var screenOffset = new Vector2(Settings.Debug.MapCenterOffsetX.Value, Settings.Debug.MapCenterOffsetY.Value);
+        var playerRender = GameController.Game.IngameState.Data.LocalPlayer?.GetComponent<Render>();
         if (playerRender == null)
-            return;
-        var rectangleF = new RectangleF(-playerRender.GridPos().X, -playerRender.GridPos().Y, _areaDimensions.Value.X, _areaDimensions.Value.Y);
-        var playerHeight = -playerRender.RenderStruct.Height;
-        var p1 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Left, rectangleF.Top), playerHeight);
-        var p2 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Right, rectangleF.Top), playerHeight);
-        var p3 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Right, rectangleF.Bottom), playerHeight);
-        var p4 = mapCenter + TranslateGridDeltaToMapDelta(new Vector2(rectangleF.Left, rectangleF.Bottom), playerHeight);
-        _backGroundWindowPtr.AddImageQuad(Graphics.GetTextureId(TextureName), p1, p2, p3, p4);
+        {
+            var cellScreenPosition = Graphics.GridToMap(absoluteGridPosition, absoluteGridPosition, VisibleSubMap.Any);
+            return playerScreenPosition + (cellScreenPosition - playerScreenPosition) * Settings.CustomScale.Value + screenOffset;
+        }
+
+        var ingameData = GameController.IngameState.Data;
+        var deltaZ = -playerRender.RenderStruct.Height;
+        if (perCellTerrain)
+            deltaZ += ingameData.GetTerrainHeightAt(absoluteGridPosition);
+
+        var mapDelta = ingameData.TranslateGridDeltaToMapDelta(GetVisibleSubMap(), absoluteGridPosition - playerGridPosition, deltaZ);
+        return playerScreenPosition + mapDelta * Settings.CustomScale.Value + screenOffset;
     }
 
-    private void DrawTargets(Vector2 mapCenter)
+    private void DrawLargeMap()
     {
-        var color = Settings.PathfindingSettings.TargetNameColor.Value;
-        var player = GameController.Game.IngameState.Data.LocalPlayer;
-        var playerRender = player.GetComponent<Render>();
-        if (playerRender == null)
-            return;
-        var playerPosition = new Vector2(playerRender.GridPos().X, playerRender.GridPos().Y);
-        var playerHeight = -playerRender.RenderStruct.Height;
+        if (!Settings.DrawWalkableMap || !Graphics.HasImage(TextureName) || _areaDimensions == null) return;
+        if (GameController.Game.IngameState.Data.LocalPlayer == null) return;
+        var areaWidth = (float)_areaDimensions.Value.X;
+        var areaHeight = (float)_areaDimensions.Value.Y;
+        var p1 = MapGridToScreen(new Vector2(0, 0), false);
+        var p2 = MapGridToScreen(new Vector2(areaWidth, 0), false);
+        var p3 = MapGridToScreen(new Vector2(areaWidth, areaHeight), false);
+        var p4 = MapGridToScreen(new Vector2(0, areaHeight), false);
+        Graphics.DrawQuad(Graphics.GetTextureId(TextureName), p1, p2, p3, p4);
+    }
+
+    private void DrawTargets()
+    {
+        var pathfindingSettings = Settings.PathfindingSettings;
+        var color = pathfindingSettings.TargetNameColor.Value;
+        if (GameController.Game.IngameState.Data.LocalPlayer?.GetComponent<Positioned>() == null) return;
         var ithElement = 0;
-        if (Settings.PathfindingSettings.ShowPathsToTargetsOnMap)
+        if (pathfindingSettings.ShowPathsToTargetsOnMap)
         {
             foreach (var route in _routes.Values)
             {
@@ -350,49 +312,41 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
                 ithElement %= 5;
                 foreach (var elem in route.Path.Skip(ithElement).GetEveryNth(5))
                 {
-                    var mapDelta = TranslateGridDeltaToMapDelta(new Vector2(elem.X, elem.Y) - playerPosition, playerHeight + _heightData[elem.Y][elem.X]);
-                    DrawBox(mapCenter + mapDelta - new Vector2(2, 2), mapCenter + mapDelta + new Vector2(2, 2), route.MapColor());
+                    var mapPos = MapGridToScreen(new Vector2(elem.X, elem.Y));
+                    Graphics.DrawBox(mapPos - new Vector2(2, 2), mapPos + new Vector2(2, 2), route.MapColor());
                 }
             }
         }
 
-        if (Settings.PathfindingSettings.ShowAllTargets)
+        if (pathfindingSettings.ShowAllTargets)
         {
+            var regex = string.IsNullOrEmpty(pathfindingSettings.TargetNameFilter) ? null : new Regex(pathfindingSettings.TargetNameFilter);
+
             foreach (var (location, texts) in _locationsByPosition)
             {
-                var regex = string.IsNullOrEmpty(Settings.PathfindingSettings.TargetNameFilter)
-                    ? null
-                    : new Regex(Settings.PathfindingSettings.TargetNameFilter);
-
-                bool TargetFilter(string t) =>
-                    (regex?.IsMatch(t) ?? true) &&
-                    _allTargetLocations.GetValueOrDefault(t) is { } list && list.Count <= Settings.PathfindingSettings.MaxTargetNameCount;
+                bool TargetFilter(string t)
+                {
+                    return (regex?.IsMatch(t) ?? true) && _allTargetLocations.GetValueOrDefault(t) is { } list && list.Count <= pathfindingSettings.MaxTargetNameCount;
+                }
 
                 var text = string.Join("\n", texts.Distinct().Where(TargetFilter));
                 var textOffset = Graphics.MeasureText(text) / 2f;
-                var mapDelta = TranslateGridDeltaToMapDelta(location - playerPosition, playerHeight + _heightData[location.Y][location.X]);
-                var mapPos = mapCenter + mapDelta;
-                if (Settings.PathfindingSettings.EnableTargetNameBackground)
-                    DrawBox(mapPos - textOffset, mapPos + textOffset, Color.Black.ToSharpDx());
-                DrawText(text, mapPos - textOffset, color);
+                var mapPos = MapGridToScreen(new Vector2(location.X, location.Y));
+                if (pathfindingSettings.EnableTargetNameBackground) Graphics.DrawBox(mapPos - textOffset, mapPos + textOffset, System.Drawing.Color.Black.ToSharpDx());
+                Graphics.DrawText(text, mapPos - textOffset, color);
             }
         }
-        else if (Settings.PathfindingSettings.ShowSelectedTargets)
+        else if (pathfindingSettings.ShowSelectedTargets)
         {
             foreach (var (_, description) in _clusteredTargetLocations)
             {
                 foreach (var clusterPosition in description.Locations)
                 {
-                    float clusterHeight = 0;
-                    if (clusterPosition.X < _heightData[0].Length && clusterPosition.Y < _heightData.Length)
-                        clusterHeight = _heightData[(int)clusterPosition.Y][(int)clusterPosition.X];
                     var text = description.DisplayName;
                     var textOffset = Graphics.MeasureText(text) / 2f;
-                    var mapDelta = TranslateGridDeltaToMapDelta(clusterPosition - playerPosition, playerHeight + clusterHeight);
-                    var mapPos = mapCenter + mapDelta;
-                    if (Settings.PathfindingSettings.EnableTargetNameBackground)
-                        DrawBox(mapPos - textOffset, mapPos + textOffset, Color.Black.ToSharpDx());
-                    DrawText(text, mapPos - textOffset, color);
+                    var mapPos = MapGridToScreen(new Vector2(clusterPosition.X, clusterPosition.Y));
+                    if (pathfindingSettings.EnableTargetNameBackground) Graphics.DrawBox(mapPos - textOffset, mapPos + textOffset, System.Drawing.Color.Black.ToSharpDx());
+                    Graphics.DrawText(text, mapPos - textOffset, color);
                 }
             }
         }
