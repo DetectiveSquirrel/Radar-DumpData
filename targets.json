@@ -44,6 +44,11 @@
       "Name": "Metadata/Terrain/Woods/Woods/AzmeriLeague/Features/arenaTransition_01.tdt",
       "ExpectedCount": 1,
       "DisplayName": "Boss stronghold"
+    },
+    {
+      "Name": "Metadata/Terrain/Woods/Woods/AzmeriLeague/hedgemaze/thickwall_cv_thinwall_01.tdt",
+      "ExpectedCount": 1,
+      "DisplayName": "Exit Maze"
     }
   ],
   "2_6_2": [
@@ -2188,6 +2193,41 @@
       "DisplayName": "The Chamber Of Innocence"
     }
   ],
+  "MapWorldsCitadel": [
+    {
+      "Name": "side_entrance",
+      "ExpectedCount": 1,
+      "DisplayName": "Arena"
+    }
+  ],
+  "MapWorldsFortress": [
+    {
+      "Name": "robot_arena",
+      "ExpectedCount": 1,
+      "DisplayName": "Arena"
+    }
+  ],
+  "MapWorldsSanctuary": [
+    {
+      "Name": "Metadata/Terrain/Theopolis/Innocence/Stairs/Innocence_stairs_straight_v01_01.tdt",
+      "ExpectedCount": 1,
+      "DisplayName": "Arena"
+    }
+  ],
+  "MapWorldsZiggurat": [
+    {
+      "Name": "transition",
+      "ExpectedCount": 2,
+      "DisplayName": "Arena"
+    }
+  ],
+  "MapWorldsAbomination": [
+    {
+      "Name": "boss_arena",
+      "ExpectedCount": 1,
+      "DisplayName": "Arena"
+    }
+  ],
   "*_Labyrinth_*": [
     {
       "Name": "entry",
@@ -2253,7 +2293,7 @@
     },
     {
       "Name": "entrance_upper",
-      "ExpectedCount": 1,
+      "ExpectedCount": 2,
       "DisplayName": "Transition"
     },
     {
@@ -2278,6 +2318,14 @@
       "Name": "Metadata/MiscellaneousObjects/AreaTransition",
       "ExpectedCount": 10,
       "DisplayName": "Escape route",
+      "TargetType": "Entity"
+    }
+  ],
+  "Map*": [
+    {
+      "Name": "Metadata/Terrain/Leagues/Settlers/Objects/VerisiumBossSubAreaEntrance",
+      "ExpectedCount": 1,
+      "DisplayName": "Starfall Crater",
       "TargetType": "Entity"
     }
   ]
